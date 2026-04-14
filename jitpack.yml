@@ -1,0 +1,6 @@
+jdk:
+  - openjdk17
+
+install:
+  - ./gradlew :kmqtt-common:publishToMavenLocal :kmqtt-client:publishToMavenLocal
+  
