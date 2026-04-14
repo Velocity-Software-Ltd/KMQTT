@@ -85,6 +85,15 @@ publishing {
 }
 
 // Signing artifacts. Signing.* extra properties values will be used
+val shouldSign = listOf(
+    getExtraString("signing.keyId"),
+    getExtraString("signing.password"),
+    getExtraString("signing.secretKeyRingFile"),
+).all { !it.isNullOrBlank() }
+
 signing {
-    sign(publishing.publications)
+    isRequired = shouldSign
+    if (shouldSign) {
+        sign(publishing.publications)
+    }
 }
