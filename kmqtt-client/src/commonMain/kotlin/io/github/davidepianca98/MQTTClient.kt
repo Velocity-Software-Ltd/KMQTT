@@ -65,6 +65,13 @@ import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.yield
 
+public enum class PublishDeliveryEvent {
+    NO_ACK_EXPECTED,
+    PUBACK,
+    PUBREC,
+    PUBCOMP,
+}
+
 /**
  * MQTT 3.1.1 and 5 client
  *
@@ -118,8 +125,10 @@ public class MQTTClient(
     private val enhancedAuthCallback: (authenticationData: UByteArray?) -> UByteArray? = { null },
     private val onConnected: (connack: MQTTConnack) -> Unit = {},
     private val onDisconnected: (disconnect: MQTTDisconnect?) -> Unit = {},
+    private val onConnectionLost: (exception: Exception?) -> Unit = {},
     private val onSubscribed: (suback: MQTTSuback) -> Unit = {},
     private val onUnsubscribed: (unsuback: MQTTUnsuback) -> Unit = {},
+    private val onPublishDeliveryEvent: (publish: MQTTPublish, event: PublishDeliveryEvent) -> Unit = { _, _ -> },
     private val debugLog: Boolean = false,
     private val publishReceived: (publish: MQTTPublish) -> Unit
 ) {
@@ -133,13 +142,17 @@ public class MQTTClient(
     private val keepAlive = atomic(keepAlive)
 
     private val currentReceivedPacket = MQTTCurrentPacket(maximumPacketSize.toUInt(), mqttVersion)
-    private val lastActiveTimestamp = atomic(currentTimeMillis())
+    private val connectStartTimestamp = atomic(currentTimeMillis())
+    private val lastReceivedTimestamp = atomic(currentTimeMillis())
+    private val pingOutstanding = atomic(false)
+    private val pingSentTimestamp = atomic(0L)
 
     // Session
     private var packetIdentifier: UInt = 1u
     // QoS 1 and QoS 2 messages which have been sent to the Server, but have not been completely acknowledged
     private val pendingAcknowledgeMessages = mutableMapOf<UInt, MQTTPublish>()
     private val pendingAcknowledgePubrel = mutableMapOf<UInt, MQTTPubrel>()
+    private val pendingCompletionMessages = mutableMapOf<UInt, MQTTPublish>()
     // QoS 2 messages which have been received from the Server, but have not been completely acknowledged
     private val qos2ListReceived = mutableListOf<UInt>()
 
@@ -190,6 +203,9 @@ public class MQTTClient(
     private fun connectSocket(readTimeout: Int, connectTimeout: Int) {
         if (socket == null) {
             connackReceived.getAndSet(false)
+            connectStartTimestamp.getAndSet(currentTimeMillis())
+            pingOutstanding.getAndSet(false)
+            pingSentTimestamp.getAndSet(0L)
             socket = if (tls == null)
                 ClientSocket(address, port, maximumPacketSize, readTimeout, connectTimeout, ::check)
             else
@@ -214,7 +230,6 @@ public class MQTTClient(
             if (debugLog) {
                 println("Sent: " + data.toHexString())
             }
-            lastActiveTimestamp.getAndSet(currentTimeMillis())
         } else {
             pendingSendMessages.value += data
         }
@@ -333,6 +348,9 @@ public class MQTTClient(
             throw Exception("Packet size too big for the server to handle")
         }
         send(data)
+        if (qos == Qos.AT_MOST_ONCE) {
+            onPublishDeliveryEvent(publish, PublishDeliveryEvent.NO_ACK_EXPECTED)
+        }
     }
 
     /**
@@ -415,12 +433,15 @@ public class MQTTClient(
             socket?.read()
         } catch (e: Exception) {
             close()
+            onConnectionLost(e)
             onDisconnected(null)
             throw e
         }
 
         if (data != null) {
             try {
+                lastReceivedTimestamp.getAndSet(currentTimeMillis())
+                pingOutstanding.getAndSet(false)
                 if (debugLog) {
                     println("Received: " + data.toHexString())
                 }
@@ -430,21 +451,25 @@ public class MQTTClient(
             } catch (e: MQTTException) {
                 lastException = e
                 disconnect(e.reasonCode)
+                onConnectionLost(e)
                 onDisconnected(null)
                 throw e
             } catch (e: EOFException) {
                 lastException = e
                 close()
+                onConnectionLost(e)
                 onDisconnected(null)
                 throw e
             } catch (e: IOException) {
                 lastException = e
                 disconnect(ReasonCode.UNSPECIFIED_ERROR)
+                onConnectionLost(e)
                 onDisconnected(null)
                 throw e
             } catch (e: Exception) {
                 lastException = e
                 disconnect(ReasonCode.IMPLEMENTATION_SPECIFIC_ERROR)
+                onConnectionLost(e)
                 onDisconnected(null)
                 throw e
             }
@@ -452,30 +477,35 @@ public class MQTTClient(
 
         // If connack not received in a reasonable amount of time, then disconnect
         val currentTime = currentTimeMillis()
-        val lastActive = lastActiveTimestamp.value
+        val connectStartedAt = connectStartTimestamp.value
         val isConnackReceived = connackReceived.value
 
-        if (!isConnackReceived && currentTime > lastActive + (connackTimeout * 1000)) {
+        if (!isConnackReceived && currentTime > connectStartedAt + (connackTimeout * 1000L)) {
             close()
-            lastException = Exception("CONNACK not received in 30 seconds")
+            lastException = Exception("CONNACK not received in $connackTimeout seconds")
+            onConnectionLost(lastException)
             throw lastException!!
         }
 
         val actualKeepAlive = keepAlive.value
         if (actualKeepAlive != 0 && isConnackReceived) {
-            if (currentTime > lastActive + (actualKeepAlive * 1000)) {
-                // Timeout
+            val keepAliveMs = actualKeepAlive * 1000L
+            val pingTimeoutMs = minOf(keepAliveMs, 10_000L)
+            val lastReceived = lastReceivedTimestamp.value
+            if (pingOutstanding.value && currentTime > pingSentTimestamp.value + pingTimeoutMs) {
                 close()
                 lastException = MQTTException(ReasonCode.KEEP_ALIVE_TIMEOUT)
+                onConnectionLost(lastException)
                 throw lastException!!
-            } else if (currentTime > lastActive + (actualKeepAlive * 1000 * 0.9)) {
+            } else if (!pingOutstanding.value && currentTime > lastReceived + (keepAliveMs * 0.9).toLong()) {
                 val pingreq = if (mqttVersion == MQTTVersion.MQTT3_1_1) {
                     MQTT4Pingreq()
                 } else {
                     MQTT5Pingreq()
                 }
                 send(pingreq.toByteArray())
-                // TODO if not receiving pingresp after a reasonable amount of time, close connection
+                pingSentTimestamp.getAndSet(currentTime)
+                pingOutstanding.getAndSet(true)
             }
         }
     }
@@ -542,6 +572,8 @@ public class MQTTClient(
     }
 
     private fun handlePacket(packet: MQTTPacket) {
+        lastReceivedTimestamp.getAndSet(currentTimeMillis())
+        pingOutstanding.getAndSet(false)
         when (packet) {
             is MQTTConnack -> handleConnack(packet)
             is MQTTPublish -> handlePublish(packet)
@@ -683,8 +715,11 @@ public class MQTTClient(
         if (packet is MQTT5Puback && properties.requestProblemInformation == 0u && (packet.properties.reasonString != null || packet.properties.userProperty.isNotEmpty())) {
             throw MQTTException(ReasonCode.PROTOCOL_ERROR)
         }
-        lock.withLock {
+        val publish = lock.withLock {
             pendingAcknowledgeMessages.remove(packet.packetId)
+        }
+        if (publish != null) {
+            onPublishDeliveryEvent(publish, PublishDeliveryEvent.PUBACK)
         }
     }
 
@@ -692,15 +727,22 @@ public class MQTTClient(
         if (packet is MQTT5Pubrec && properties.requestProblemInformation == 0u && (packet.properties.reasonString != null || packet.properties.userProperty.isNotEmpty())) {
             throw MQTTException(ReasonCode.PROTOCOL_ERROR)
         }
+        var publish: MQTTPublish? = null
         lock.withLock {
-            pendingAcknowledgeMessages.remove(packet.packetId)
+            publish = pendingAcknowledgeMessages.remove(packet.packetId)
             val pubrel = if (packet is MQTT4Pubrec) {
                 MQTT4Pubrel(packet.packetId)
             } else {
                 MQTT5Pubrel(packet.packetId)
             }
             pendingAcknowledgePubrel[packet.packetId] = pubrel
+            if (publish != null) {
+                pendingCompletionMessages[packet.packetId] = publish
+            }
             send(pubrel.toByteArray())
+        }
+        if (publish != null) {
+            onPublishDeliveryEvent(publish, PublishDeliveryEvent.PUBREC)
         }
     }
 
@@ -723,10 +765,15 @@ public class MQTTClient(
         if (packet is MQTT5Pubcomp && properties.requestProblemInformation == 0u && (packet.properties.reasonString != null || packet.properties.userProperty.isNotEmpty())) {
             throw MQTTException(ReasonCode.PROTOCOL_ERROR)
         }
+        var publish: MQTTPublish? = null
         lock.withLock {
             if (pendingAcknowledgePubrel.remove(packet.packetId) == null) {
                 throw MQTTException(ReasonCode.PACKET_IDENTIFIER_NOT_FOUND)
             }
+            publish = pendingCompletionMessages.remove(packet.packetId)
+        }
+        if (publish != null) {
+            onPublishDeliveryEvent(publish!!, PublishDeliveryEvent.PUBCOMP)
         }
     }
 
@@ -758,7 +805,7 @@ public class MQTTClient(
     }
 
     private fun handlePingresp() {
-        lastActiveTimestamp.getAndSet(currentTimeMillis())
+        pingOutstanding.getAndSet(false)
     }
 
     private fun handleAuth(packet: MQTT5Auth) {
@@ -804,6 +851,8 @@ public class MQTTClient(
         running.getAndSet(false)
         socket?.close()
         connackReceived.getAndSet(false)
+        pingOutstanding.getAndSet(false)
+        pingSentTimestamp.getAndSet(0L)
         socket = null
     }
 }

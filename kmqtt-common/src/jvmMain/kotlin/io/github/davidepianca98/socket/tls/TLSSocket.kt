@@ -46,11 +46,11 @@ public actual open class TLSSocket(
     }
 
     private fun handleSendBufferOverflow() {
-        sendBuffer1 = if (engine.session.packetBufferSize > sendBuffer1.capacity()) {
-            ByteBuffer.allocate(engine.session.applicationBufferSize)
-        } else {
-            ByteBuffer.allocate(sendBuffer1.capacity() * 2)
-        }
+        val newCapacity = maxOf(engine.session.packetBufferSize, sendBuffer1.capacity() * 2)
+        val newBuffer = ByteBuffer.allocate(newCapacity)
+        sendBuffer1.flip()
+        newBuffer.put(sendBuffer1)
+        sendBuffer1 = newBuffer
     }
 
     private fun send0(data: UByteArray) {
